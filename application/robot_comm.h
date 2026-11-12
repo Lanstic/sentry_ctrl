@@ -18,8 +18,13 @@ typedef struct
 
 typedef struct
 {
+    uint8_t mode;
     fp32 yaw;
+    fp32 yaw_vel;
+    fp32 yaw_acc;
     fp32 pitch;
+    fp32 pitch_vel;
+    fp32 pitch_acc;
     uint32_t timestamp;
 } robot_gimbal_cmd_t;
 

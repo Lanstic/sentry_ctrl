@@ -28,7 +28,7 @@
 #define ROBOT_COMM_GIMBAL_CMD_PACKET_SIZE 18U
 #define ROBOT_COMM_GIMBAL_CMD_DATA_SIZE   12U
 #define ROBOT_COMM_RX_RING_SIZE         1024U
-#define ROBOT_COMM_PARSE_BUF_SIZE       128U
+#define ROBOT_COMM_PARSE_BUF_SIZE       192U
 #define ROBOT_COMM_MAX_DATA_SIZE        80U
 #define ROBOT_COMM_TX_BUSY_RETRY_COUNT  2U
 
@@ -37,6 +37,11 @@
 #define ROBOT_COMM_TEXT_TELEMETRY_MS    100U
 #define ROBOT_COMM_TEXT_BUFFER_SIZE     320U
 #define ROBOT_COMM_RAD_TO_DEG           57.2957795f
+#define ROBOT_COMM_ASCII_COMMAND_BUFFER_SIZE 192U
+#define ROBOT_COMM_ASCII_CRC16_INIT     0xFFFFU
+#define ROBOT_COMM_GIMBAL_ANGLE_LIMIT   3.1415927f
+#define ROBOT_COMM_GIMBAL_VEL_LIMIT     100.0f
+#define ROBOT_COMM_GIMBAL_ACC_LIMIT     1000.0f
 
 #pragma pack(push, 1)
 
@@ -118,7 +123,7 @@ static volatile uint32_t rx_overflow_count;
 static uint8_t parse_buf[ROBOT_COMM_PARSE_BUF_SIZE];
 static uint16_t parse_len;
 #if ROBOT_COMM_ASCII_COMMAND_INPUT
-static char ascii_cmd_buf[64];
+static char ascii_cmd_buf[ROBOT_COMM_ASCII_COMMAND_BUFFER_SIZE];
 static uint16_t ascii_cmd_len;
 #endif
 
@@ -155,6 +160,8 @@ static void send_packet(void *packet, uint16_t size);
 static void parse_received_bytes(void);
 #if ROBOT_COMM_ASCII_COMMAND_INPUT
 static void parse_ascii_gimbal_command(const char *command);
+static uint8_t parse_ascii_sp_gimbal_command(const char *command);
+static uint8_t ascii_hex_value(char value, uint8_t *result);
 #endif
 static uint8_t rx_pop(uint8_t *data);
 static void parse_command(const uint8_t *frame, uint16_t size);
@@ -520,10 +527,17 @@ static void parse_ascii_gimbal_command(const char *command)
         command++;
     }
 
+    if (command[0] == 'S' && command[1] == 'P' && command[2] == ',')
+    {
+        (void)parse_ascii_sp_gimbal_command(command);
+        return;
+    }
+
     if (command[0] == 'S' || command[0] == 's')
     {
         primask = __get_PRIMASK();
         __disable_irq();
+        latest_gimbal_cmd.mode = 0U;
         latest_gimbal_cmd_valid = 0U;
         if (primask == 0U)
         {
@@ -549,8 +563,13 @@ static void parse_ascii_gimbal_command(const char *command)
 
     primask = __get_PRIMASK();
     __disable_irq();
+    latest_gimbal_cmd.mode = 1U;
     latest_gimbal_cmd.yaw = (fp32)yaw_deg * 0.01745329252f;
+    latest_gimbal_cmd.yaw_vel = 0.0f;
+    latest_gimbal_cmd.yaw_acc = 0.0f;
     latest_gimbal_cmd.pitch = (fp32)pitch_deg * 0.01745329252f;
+    latest_gimbal_cmd.pitch_vel = 0.0f;
+    latest_gimbal_cmd.pitch_acc = 0.0f;
     latest_gimbal_cmd.timestamp = HAL_GetTick();
     if (latest_gimbal_cmd.timestamp == 0U)
     {
@@ -562,6 +581,133 @@ static void parse_ascii_gimbal_command(const char *command)
     {
         __enable_irq();
     }
+}
+
+static uint8_t parse_ascii_sp_gimbal_command(const char *command)
+{
+    /* The CRC covers the named-field payload before '*', excluding CR/LF. */
+    const char *star;
+    uint16_t expected_crc;
+    uint16_t calculated_crc;
+    uint16_t payload_len;
+    uint16_t crc_text_len;
+    uint8_t crc_nibble;
+    unsigned int mode;
+    fp32 yaw;
+    fp32 yaw_vel;
+    fp32 yaw_acc;
+    fp32 pitch;
+    fp32 pitch_vel;
+    fp32 pitch_acc;
+    int parsed_len;
+    uint16_t i;
+    uint32_t now;
+    uint32_t primask;
+
+    if (command == NULL || command[0] != 'S' || command[1] != 'P' ||
+        command[2] != ',')
+    {
+        return 0U;
+    }
+
+    star = strchr(command, '*');
+    if (star == NULL || star <= command || star[1] == '\0')
+    {
+        return 0U;
+    }
+
+    payload_len = (uint16_t)(star - command);
+    crc_text_len = (uint16_t)strlen(star + 1);
+    if (payload_len >= ROBOT_COMM_ASCII_COMMAND_BUFFER_SIZE ||
+        crc_text_len != 4U)
+    {
+        return 0U;
+    }
+
+    expected_crc = 0U;
+    for (i = 0U; i < 4U; i++)
+    {
+        if (!ascii_hex_value(star[1U + i], &crc_nibble))
+        {
+            return 0U;
+        }
+        expected_crc = (uint16_t)((expected_crc << 4) | crc_nibble);
+    }
+
+    calculated_crc = get_CRC16_check_sum(
+        (uint8_t *)command, payload_len, ROBOT_COMM_ASCII_CRC16_INIT);
+    if (calculated_crc != expected_crc)
+    {
+        return 0U;
+    }
+
+    parsed_len = 0;
+    if (sscanf(command,
+               "SP,mode:%u,yaw:%f,yaw_vel:%f,yaw_acc:%f,pitch:%f,pitch_vel:%f,pitch_acc:%f%n",
+               &mode, &yaw, &yaw_vel, &yaw_acc, &pitch, &pitch_vel,
+               &pitch_acc, &parsed_len) != 7 ||
+        parsed_len != (int)payload_len || mode > 3U ||
+        !command_value_valid(yaw, ROBOT_COMM_GIMBAL_ANGLE_LIMIT) ||
+        !command_value_valid(yaw_vel, ROBOT_COMM_GIMBAL_VEL_LIMIT) ||
+        !command_value_valid(yaw_acc, ROBOT_COMM_GIMBAL_ACC_LIMIT) ||
+        !command_value_valid(pitch, ROBOT_COMM_GIMBAL_ANGLE_LIMIT) ||
+        !command_value_valid(pitch_vel, ROBOT_COMM_GIMBAL_VEL_LIMIT) ||
+        !command_value_valid(pitch_acc, ROBOT_COMM_GIMBAL_ACC_LIMIT))
+    {
+        return 0U;
+    }
+
+    now = HAL_GetTick();
+    if (now == 0U)
+    {
+        now = 1U;
+    }
+
+    primask = __get_PRIMASK();
+    __disable_irq();
+    latest_gimbal_cmd.mode = (uint8_t)mode;
+    latest_gimbal_cmd.yaw = yaw;
+    latest_gimbal_cmd.yaw_vel = yaw_vel;
+    latest_gimbal_cmd.yaw_acc = yaw_acc;
+    latest_gimbal_cmd.pitch = pitch;
+    latest_gimbal_cmd.pitch_vel = pitch_vel;
+    latest_gimbal_cmd.pitch_acc = pitch_acc;
+    latest_gimbal_cmd.timestamp = now;
+    latest_gimbal_cmd_tick = now;
+    latest_gimbal_cmd_valid = (mode != 0U) ? 1U : 0U;
+    if (primask == 0U)
+    {
+        __enable_irq();
+    }
+
+    return 1U;
+}
+
+static uint8_t ascii_hex_value(char value, uint8_t *result)
+{
+    if (result == NULL)
+    {
+        return 0U;
+    }
+
+    if (value >= '0' && value <= '9')
+    {
+        *result = (uint8_t)(value - '0');
+    }
+    else if (value >= 'A' && value <= 'F')
+    {
+        *result = (uint8_t)(value - 'A' + 10);
+    }
+    else if (value >= 'a' && value <= 'f')
+    {
+        *result = (uint8_t)(value - 'a' + 10);
+    }
+    else
+    {
+        return 0U;
+    }
+
+    return 1U;
 }
 #endif
 
@@ -630,8 +776,13 @@ static void parse_gimbal_command(const uint8_t *frame, uint16_t size)
 
     primask = __get_PRIMASK();
     __disable_irq();
+    latest_gimbal_cmd.mode = 1U;
     latest_gimbal_cmd.yaw = yaw;
+    latest_gimbal_cmd.yaw_vel = 0.0f;
+    latest_gimbal_cmd.yaw_acc = 0.0f;
     latest_gimbal_cmd.pitch = pitch;
+    latest_gimbal_cmd.pitch_vel = 0.0f;
+    latest_gimbal_cmd.pitch_acc = 0.0f;
     latest_gimbal_cmd.timestamp = timestamp;
     latest_gimbal_cmd_tick = HAL_GetTick();
     latest_gimbal_cmd_valid = 1;
