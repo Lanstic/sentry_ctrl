@@ -1,0 +1,223 @@
+--- a/application/chassis_task.c
++++ b/application/chassis_task.c
+@@ -28,7 +28,185 @@
+ #include "detect_task.h"
+ #include "INS_task.h"
+ #include "chassis_power_control.h"
++#include <math.h>
+ 
++/* Spin exit only. Chassis yaw: rad/s, positive CCW. Joint q = gimbal - chassis. */
++#define CHASSIS_ALIGN_ENABLE          1
++#define CHASSIS_ALIGN_MAX_WZ          9.5f    /* rad/s; does not change auto-spin */
++#define CHASSIS_ALIGN_ACCEL           12.0f   /* rad/s^2, command slew limit */
++#define CHASSIS_ALIGN_BRAKE           10.0f   /* rad/s^2, below the command slew limit */
++#define CHASSIS_ALIGN_LAG             0.10f   /* s, measured-speed stopping reserve */
++#define CHASSIS_ALIGN_MARGIN          0.05f   /* rad, entry stopping reserve */
++#define CHASSIS_ALIGN_TOL             0.03f   /* rad, about 1.7 degrees */
++#define CHASSIS_ALIGN_SETTLE_WZ       0.20f   /* rad/s, command AND feedback */
++#define CHASSIS_ALIGN_REVERSE_WZ      0.30f   /* rad/s, residual correction only */
++#define CHASSIS_ALIGN_DWELL_MS        100U
++#define CHASSIS_ALIGN_DT             (CHASSIS_CONTROL_TIME_MS * 0.001f)
++#define CHASSIS_ALIGN_TWO_PI         6.2831853071795864769f
++
++extern uint8_t chassis_last_frame_in_auto_spin;
++
++enum { ALIGN_OFF = 0, ALIGN_INIT, ALIGN_DIRECTED, ALIGN_FOLLOW };
++static struct
++{
++    fp32 direction;      /* S from the last auto-spin wz_set, +/-1 or 0 */
++    fp32 remaining;      /* rad along S; continuous, NOT wrapped each cycle */
++    fp32 last_joint;     /* rad, wrapped encoder joint angle */
++    fp32 last_target;    /* rad, wrapped live target including SWING */
++    fp32 command;        /* rad/s, last output of this limiter */
++    uint16_t settled_ms;
++    uint8_t state;
++} chassis_align;
++static uint8_t chassis_angle_pid_seed;
++
++/* Clearing alone would still produce Kd * e on the first PID_calc(). */
++static fp32 chassis_angle_step(pid_type_def *pid, fp32 error)
++{
++    if (chassis_angle_pid_seed)
++    {
++        PID_clear(pid);
++        pid->error[0] = pid->error[1] = pid->error[2] = error;
++        chassis_angle_pid_seed = 0;
++    }
++    return PID_calc(pid, 0.0f, error);
++}
++
++static fp32 chassis_follow_yaw_command(chassis_move_t *move, fp32 target)
++{
++    fp32 joint = move->chassis_yaw_motor->relative_angle;
++    fp32 error = rad_format(target - joint);
++    fp32 request;
++    fp32 limit;
++    fp32 distance;
++    fp32 speed;
++    fp32 brake_step = CHASSIS_ALIGN_BRAKE * CHASSIS_ALIGN_DT;
++    fp32 step = CHASSIS_ALIGN_ACCEL * CHASSIS_ALIGN_DT;
++
++    if (CHASSIS_ALIGN_ENABLE &&
++        (toe_is_error(DBUS_TOE) || toe_is_error(YAW_GIMBAL_MOTOR_TOE) ||
++         toe_is_error(CHASSIS_MOTOR1_TOE) || toe_is_error(CHASSIS_MOTOR2_TOE) ||
++         toe_is_error(CHASSIS_MOTOR3_TOE) || toe_is_error(CHASSIS_MOTOR4_TOE)))
++    {
++        /* Do not integrate stale feedback. Recovery starts from zero command. */
++        chassis_align.state = ALIGN_INIT;
++        chassis_align.command = 0.0f;
++        chassis_align.settled_ms = 0;
++        chassis_angle_pid_seed = 1;
++        PID_clear(&move->chassis_angle_pid);
++        return 0.0f;
++    }
++
++    if (chassis_align.state == ALIGN_INIT)
++    {
++        chassis_align.direction = (chassis_align.command > 0.0f) ? 1.0f :
++                                  ((chassis_align.command < 0.0f) ? -1.0f : 0.0f);
++        chassis_align.remaining = -chassis_align.direction * error;
++        if (chassis_align.remaining < 0.0f)
++        {
++            chassis_align.remaining += CHASSIS_ALIGN_TWO_PI;
++        }
++        speed = fmaxf(fabsf(chassis_align.command),
++                      chassis_align.direction * move->wz);
++        distance = speed * speed / (2.0f * CHASSIS_ALIGN_BRAKE) +
++                   speed * (CHASSIS_ALIGN_DT + CHASSIS_ALIGN_LAG) + CHASSIS_ALIGN_MARGIN;
++        if (chassis_align.direction != 0.0f && chassis_align.remaining < distance)
++        {
++            /* Skip an alignment point that cannot be reached without hard braking. */
++            chassis_align.remaining += CHASSIS_ALIGN_TWO_PI *
++                ceilf((distance - chassis_align.remaining) / CHASSIS_ALIGN_TWO_PI);
++        }
++        chassis_align.last_joint = joint;
++        chassis_align.last_target = target;
++        chassis_align.settled_ms = 0;
++        chassis_align.state = (chassis_align.direction == 0.0f) ? ALIGN_FOLLOW : ALIGN_DIRECTED;
++        chassis_angle_pid_seed = 1;
++        if (chassis_align.state == ALIGN_DIRECTED)
++        {
++            error = -chassis_align.direction * chassis_align.remaining;
++        }
++        (void)chassis_angle_step(&move->chassis_angle_pid, error);
++        return chassis_align.command; /* Exact continuity on the switching frame. */
++    }
++
++    if (chassis_align.state == ALIGN_DIRECTED)
++    {
++        /* q_dot = gimbal_yaw_rate - chassis_wz; positive wz reduces q. */
++        chassis_align.remaining += chassis_align.direction *
++            (rad_format(joint - chassis_align.last_joint) -
++             rad_format(target - chassis_align.last_target));
++        chassis_align.last_joint = joint;
++        chassis_align.last_target = target;
++        if (chassis_align.remaining < -CHASSIS_ALIGN_TOL)
++        {
++            /* Missed the capture window (lag or moving target): keep direction S. */
++            speed = fmaxf(fabsf(chassis_align.command), chassis_align.direction * move->wz);
++            distance = speed * speed / (2.0f * CHASSIS_ALIGN_BRAKE) +
++                       speed * (CHASSIS_ALIGN_DT + CHASSIS_ALIGN_LAG) + CHASSIS_ALIGN_MARGIN;
++            chassis_align.remaining += CHASSIS_ALIGN_TWO_PI *
++                ceilf((distance - chassis_align.remaining) / CHASSIS_ALIGN_TWO_PI);
++            chassis_angle_pid_seed = 1;
++        }
++        error = -chassis_align.direction * chassis_align.remaining;
++        request = -chassis_angle_step(&move->chassis_angle_pid, error);
++        distance = fabsf(chassis_align.remaining);
++        /* v*dt + v^2/(2*a) <= distance, with the existing PID for the final approach. */
++        speed = fmaxf(0.0f, ((chassis_align.remaining >= 0.0f) ?
++                            chassis_align.direction : -chassis_align.direction) * move->wz);
++        limit = fmaxf(0.0f, distance - CHASSIS_ALIGN_LAG * speed);
++        limit = sqrtf(brake_step * brake_step + 2.0f * CHASSIS_ALIGN_BRAKE * limit) - brake_step;
++        limit = fp32_constrain(limit, 0.0f, CHASSIS_ALIGN_MAX_WZ);
++        request = chassis_align.direction * request;
++        if (chassis_align.remaining >= 0.0f)
++        {
++            request = fp32_constrain(request, 0.0f, limit);
++        }
++        else
++        {
++            /* Reverse correction only inside tolerance and after measured braking. */
++            limit = fminf(limit, CHASSIS_ALIGN_REVERSE_WZ);
++            if (fabsf(chassis_align.command) > CHASSIS_ALIGN_SETTLE_WZ ||
++                fabsf(move->wz) > CHASSIS_ALIGN_SETTLE_WZ)
++            {
++                limit = 0.0f;
++            }
++            request = fp32_constrain(request, -limit, 0.0f);
++        }
++        request *= chassis_align.direction;
++
++        if (distance <= CHASSIS_ALIGN_TOL &&
++            fabsf(chassis_align.command) <= CHASSIS_ALIGN_SETTLE_WZ &&
++            fabsf(move->wz) <= CHASSIS_ALIGN_SETTLE_WZ)
++        {
++            chassis_align.settled_ms += CHASSIS_CONTROL_TIME_MS;
++            if (chassis_align.settled_ms >= CHASSIS_ALIGN_DWELL_MS)
++            {
++                chassis_align.state = ALIGN_FOLLOW;
++                chassis_angle_pid_seed = 1;
++            }
++        }
++        else
++        {
++            chassis_align.settled_ms = 0;
++        }
++    }
++    else
++    {
++        /* Avoid a derivative pulse when the shortest error crosses +/-pi. */
++        if (fabsf(error - move->chassis_angle_pid.error[0]) > CHASSIS_ALIGN_TWO_PI * 0.5f)
++        {
++            chassis_angle_pid_seed = 1;
++        }
++        request = -chassis_angle_step(&move->chassis_angle_pid, error);
++    }
++
++    if (chassis_align.state != ALIGN_OFF)
++    {
++        chassis_align.command += fp32_constrain(request - chassis_align.command, -step, step);
++        return chassis_align.command; /* Keep slew limiting after PID handover. */
++    }
++    return request;
++}
++
+ #define rc_deadband_limit(input, output, dealine)        \
+     {                                                    \
+         if ((input) > (dealine) || (input) < -(dealine)) \
+@@ -309,6 +487,16 @@
+         return;
+     }
+ 
++    PID_clear(&chassis_move_transit->chassis_angle_pid);
++    chassis_angle_pid_seed = 1;
++    chassis_align.state = ALIGN_OFF;
++    if (CHASSIS_ALIGN_ENABLE && chassis_last_frame_in_auto_spin &&
++        chassis_move_transit->chassis_mode == CHASSIS_VECTOR_FOLLOW_GIMBAL_YAW)
++    {
++        chassis_align.command = chassis_move_transit->wz_set;
++        chassis_align.state = ALIGN_INIT;
++    }
++
+     //change to follow gimbal angle mode
+     //041¡è7041¡è7041¡è7041¡è7041¡è7041¡è7041¡è7041¡è7041¡è7010086010050010094
+     if ((chassis_move_transit->last_chassis_mode != CHASSIS_VECTOR_FOLLOW_GIMBAL_YAW) && chassis_move_transit->chassis_mode == CHASSIS_VECTOR_FOLLOW_GIMBAL_YAW)
+@@ -480,7 +668,7 @@
+         chassis_move_control->chassis_relative_angle_set = rad_format(angle_set);
+         //calculate ratation speed
+         //041¡è7041¡è7041¡è7041¡è7041¡è7041¡è7010048PID041¡è7041¡è7041¡è7011018041¡è7
++        chassis_move_control->wz_set = chassis_follow_yaw_command(chassis_move_control, chassis_move_control->chassis_relative_angle_set);
+-        chassis_move_control->wz_set = -PID_calc(&chassis_move_control->chassis_angle_pid, chassis_move_control->chassis_yaw_motor->relative_angle, chassis_move_control->chassis_relative_angle_set);
+         //speed limit
+         //041¡è7011018041¡è7041¡è7011009041¡è7
+         chassis_move_control->vx_set = fp32_constrain(chassis_move_control->vx_set, chassis_move_control->vx_min_speed, chassis_move_control->vx_max_speed);
+@@ -495,7 +683,7 @@
+         delat_angle = rad_format(chassis_move_control->chassis_yaw_set - chassis_move_control->chassis_yaw);
+         //calculate rotation speed
+         //041¡è7041¡è7041¡è7041¡è7041¡è7041¡è7010048041¡è7010075041¡è7041¡è7011018041¡è7
++        chassis_move_control->wz_set = chassis_angle_step(&chassis_move_control->chassis_angle_pid, delat_angle);
+-        chassis_move_control->wz_set = PID_calc(&chassis_move_control->chassis_angle_pid, 0.0f, delat_angle);
+         //speed limit
+         //041¡è7011018041¡è7041¡è7011009041¡è7
+         chassis_move_control->vx_set = fp32_constrain(vx_set, chassis_move_control->vx_min_speed, chassis_move_control->vx_max_speed);
