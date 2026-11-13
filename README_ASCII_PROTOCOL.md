@@ -11,9 +11,9 @@ struct __attribute__((packed)) GimbalToVision {
     uint8_t head[2];       // 'S', 'P'
     uint8_t mode;          // 1: 自瞄（空闲握手也发送 1）
     float q[4];             // wxyz
-    float yaw;              // rad
+    float yaw;              // absolute yaw, rad
     float yaw_vel;          // rad/s
-    float pitch;            // rad
+    float pitch;            // absolute pitch, rad
     float pitch_vel;        // rad/s
     float bullet_speed;     // 当前固件未接入裁判系统，发送 0
     uint16_t bullet_count;  // 当前固件未接入发射计数，发送 0

@@ -967,9 +967,9 @@ static void send_gimbal_state(void)
     }
 
     memcpy(gimbal_state_packet.q, quat, sizeof(gimbal_state_packet.q));
-    gimbal_state_packet.yaw = yaw->relative_angle;
+    gimbal_state_packet.yaw = yaw->absolute_angle;
     gimbal_state_packet.yaw_vel = yaw->motor_gyro;
-    gimbal_state_packet.pitch = pitch->relative_angle;
+    gimbal_state_packet.pitch = pitch->absolute_angle;
     gimbal_state_packet.pitch_vel = pitch->motor_gyro;
     gimbal_state_packet.bullet_speed = 0.0f;
     gimbal_state_packet.bullet_count = 0U;

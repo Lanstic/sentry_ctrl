@@ -304,27 +304,6 @@ gimbal_control_t gimbal_control;
 //???????????
 static int16_t yaw_can_set_current = 0, pitch_can_set_current = 0, shoot_can_set_current = 0;
 
-static fp32 gimbal_cmd_clamp(
-    fp32 value, fp32 min_value, fp32 max_value, fp32 margin)
-{
-    const fp32 low = min_value + margin;
-    const fp32 high = max_value - margin;
-
-    if (low >= high)
-    {
-        return (min_value + max_value) * 0.5f;
-    }
-    if (value < low)
-    {
-        return low;
-    }
-    if (value > high)
-    {
-        return high;
-    }
-    return value;
-}
-
 /**
   * @brief          gimbal task, osDelay GIMBAL_CONTROL_TIME (1ms) 
   * @param[in]      pvParameters: null
@@ -364,9 +343,9 @@ void gimbal_task(void const *pvParameters)
         if (usb_gimbal_active)
         {
             gimbal_control.gimbal_yaw_motor.gimbal_motor_mode =
-                GIMBAL_MOTOR_ENCONDE;
+                GIMBAL_MOTOR_GYRO;
             gimbal_control.gimbal_pitch_motor.gimbal_motor_mode =
-                GIMBAL_MOTOR_ENCONDE;
+                GIMBAL_MOTOR_GYRO;
         }
         else
         {
@@ -376,18 +355,17 @@ void gimbal_task(void const *pvParameters)
         gimbal_feedback_update(&gimbal_control);             //??????????
         if (usb_gimbal_active)
         {
-            gimbal_control.gimbal_yaw_motor.relative_angle_set =
-                gimbal_cmd_clamp(
-                    gimbal_cmd.yaw,
-                    gimbal_control.gimbal_yaw_motor.min_relative_angle,
-                    gimbal_control.gimbal_yaw_motor.max_relative_angle,
-                    0.02f);
-            gimbal_control.gimbal_pitch_motor.relative_angle_set =
-                gimbal_cmd_clamp(
-                    gimbal_cmd.pitch,
-                    gimbal_control.gimbal_pitch_motor.min_relative_angle,
-                    gimbal_control.gimbal_pitch_motor.max_relative_angle,
-                    0.02f);
+            gimbal_control.gimbal_yaw_motor.absolute_angle_set =
+                gimbal_control.gimbal_yaw_motor.absolute_angle;
+            gimbal_absolute_angle_limit(
+                &gimbal_control.gimbal_yaw_motor,
+                rad_format(gimbal_cmd.yaw - gimbal_control.gimbal_yaw_motor.absolute_angle));
+
+            gimbal_control.gimbal_pitch_motor.absolute_angle_set =
+                gimbal_control.gimbal_pitch_motor.absolute_angle;
+            gimbal_absolute_angle_limit(
+                &gimbal_control.gimbal_pitch_motor,
+                rad_format(gimbal_cmd.pitch - gimbal_control.gimbal_pitch_motor.absolute_angle));
         }
         else
         {
