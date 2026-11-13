@@ -32,9 +32,10 @@
 #define ROBOT_COMM_MAX_DATA_SIZE        80U
 #define ROBOT_COMM_TX_BUSY_RETRY_COUNT  2U
 
-#define ROBOT_COMM_TEXT_TELEMETRY       1U
+#define ROBOT_COMM_TEXT_TELEMETRY       0U
 #define ROBOT_COMM_ASCII_COMMAND_INPUT  1U
-#define ROBOT_COMM_TEXT_TELEMETRY_MS    100U
+#define ROBOT_COMM_GIMBAL_STATE_TELEMETRY 1U
+#define ROBOT_COMM_GIMBAL_STATE_TELEMETRY_MS 10U
 #define ROBOT_COMM_TEXT_BUFFER_SIZE     320U
 #define ROBOT_COMM_RAD_TO_DEG           57.2957795f
 #define ROBOT_COMM_ASCII_COMMAND_BUFFER_SIZE 192U
@@ -106,6 +107,20 @@ typedef struct
     uint16_t checksum;
 } robot_comm_joint_packet_t;
 
+typedef struct
+{
+    uint8_t head[2];
+    uint8_t mode;
+    fp32 q[4];
+    fp32 yaw;
+    fp32 yaw_vel;
+    fp32 pitch;
+    fp32 pitch_vel;
+    fp32 bullet_speed;
+    uint16_t bullet_count;
+    uint16_t crc16;
+} robot_comm_gimbal_state_packet_t;
+
 #pragma pack(pop)
 
 #define ROBOT_COMM_STATIC_ASSERT(name, condition) typedef char name[(condition) ? 1 : -1]
@@ -114,6 +129,7 @@ ROBOT_COMM_STATIC_ASSERT(robot_comm_imu_size_check, sizeof(robot_comm_imu_packet
 ROBOT_COMM_STATIC_ASSERT(robot_comm_info_size_check, sizeof(robot_comm_robot_info_packet_t) == 13U);
 ROBOT_COMM_STATIC_ASSERT(robot_comm_motion_size_check, sizeof(robot_comm_motion_packet_t) == 22U);
 ROBOT_COMM_STATIC_ASSERT(robot_comm_joint_size_check, sizeof(robot_comm_joint_packet_t) == 18U);
+ROBOT_COMM_STATIC_ASSERT(robot_comm_gimbal_state_size_check, sizeof(robot_comm_gimbal_state_packet_t) == 43U);
 
 static uint8_t rx_ring[ROBOT_COMM_RX_RING_SIZE];
 static volatile uint16_t rx_head;
@@ -139,6 +155,8 @@ static robot_comm_imu_packet_t imu_packet __ALIGNED(4);
 static robot_comm_robot_info_packet_t robot_info_packet __ALIGNED(4);
 static robot_comm_motion_packet_t motion_packet __ALIGNED(4);
 static robot_comm_joint_packet_t joint_packet __ALIGNED(4);
+static robot_comm_gimbal_state_packet_t gimbal_state_packet __ALIGNED(4);
+static uint8_t telemetry_mode;
 
 #if ROBOT_COMM_TEXT_TELEMETRY
 static char text_telemetry_buffers[2][ROBOT_COMM_TEXT_BUFFER_SIZE] __ALIGNED(4);
@@ -171,6 +189,9 @@ static void send_imu(void);
 static void send_robot_info(void);
 static void send_motion(void);
 static void send_joint_state(void);
+#endif
+#if ROBOT_COMM_GIMBAL_STATE_TELEMETRY
+static void send_gimbal_state(void);
 #endif
 static void prepare_header(robot_comm_header_t *header, uint8_t id, uint16_t size);
 static uint8_t command_value_valid(fp32 value, fp32 limit);
@@ -212,6 +233,10 @@ void robot_comm_init(void)
     memset(&robot_info_packet, 0, sizeof(robot_info_packet));
     memset(&motion_packet, 0, sizeof(motion_packet));
     memset(&joint_packet, 0, sizeof(joint_packet));
+    memset(&gimbal_state_packet, 0, sizeof(gimbal_state_packet));
+    gimbal_state_packet.head[0] = 'S';
+    gimbal_state_packet.head[1] = 'P';
+    telemetry_mode = 1U;
 
     prepare_header(&imu_packet.header, ROBOT_COMM_IMU_ID, sizeof(imu_packet));
     prepare_header(&robot_info_packet.header, ROBOT_COMM_ROBOT_INFO_ID,
@@ -267,8 +292,14 @@ void robot_comm_update(void)
     parse_received_bytes();
 
     now = HAL_GetTick();
-#if ROBOT_COMM_TEXT_TELEMETRY
-    if ((uint32_t)(now - last_telemetry_tick) >= ROBOT_COMM_TEXT_TELEMETRY_MS)
+#if ROBOT_COMM_GIMBAL_STATE_TELEMETRY
+    if ((uint32_t)(now - last_telemetry_tick) >= ROBOT_COMM_GIMBAL_STATE_TELEMETRY_MS)
+    {
+        last_telemetry_tick = now;
+        send_gimbal_state();
+    }
+#elif ROBOT_COMM_TEXT_TELEMETRY
+    if ((uint32_t)(now - last_telemetry_tick) >= 100U)
     {
         last_telemetry_tick = now;
         send_text_telemetry();
@@ -539,6 +570,7 @@ static void parse_ascii_gimbal_command(const char *command)
         __disable_irq();
         latest_gimbal_cmd.mode = 0U;
         latest_gimbal_cmd_valid = 0U;
+        telemetry_mode = 0U;
         if (primask == 0U)
         {
             __enable_irq();
@@ -564,6 +596,7 @@ static void parse_ascii_gimbal_command(const char *command)
     primask = __get_PRIMASK();
     __disable_irq();
     latest_gimbal_cmd.mode = 1U;
+    telemetry_mode = 1U;
     latest_gimbal_cmd.yaw = (fp32)yaw_deg * 0.01745329252f;
     latest_gimbal_cmd.yaw_vel = 0.0f;
     latest_gimbal_cmd.yaw_acc = 0.0f;
@@ -666,6 +699,7 @@ static uint8_t parse_ascii_sp_gimbal_command(const char *command)
     primask = __get_PRIMASK();
     __disable_irq();
     latest_gimbal_cmd.mode = (uint8_t)mode;
+    telemetry_mode = (uint8_t)mode;
     latest_gimbal_cmd.yaw = yaw;
     latest_gimbal_cmd.yaw_vel = yaw_vel;
     latest_gimbal_cmd.yaw_acc = yaw_acc;
@@ -777,6 +811,7 @@ static void parse_gimbal_command(const uint8_t *frame, uint16_t size)
     primask = __get_PRIMASK();
     __disable_irq();
     latest_gimbal_cmd.mode = 1U;
+    telemetry_mode = 1U;
     latest_gimbal_cmd.yaw = yaw;
     latest_gimbal_cmd.yaw_vel = 0.0f;
     latest_gimbal_cmd.yaw_acc = 0.0f;
@@ -905,6 +940,61 @@ static void send_joint_state(void)
     joint_packet.data.pitch = pitch->relative_angle;
     joint_packet.data.yaw = yaw->relative_angle;
     send_packet(&joint_packet, sizeof(joint_packet));
+}
+#endif
+
+#if ROBOT_COMM_GIMBAL_STATE_TELEMETRY
+static void send_gimbal_state(void)
+{
+    const fp32 *quat = get_INS_quat_point();
+    const gimbal_motor_t *pitch = get_pitch_motor_point();
+    const gimbal_motor_t *yaw = get_yaw_motor_point();
+    uint32_t now = HAL_GetTick();
+    uint8_t result;
+    uint8_t retry;
+
+    /* Advertise auto-aim while idle so the vision process can complete its
+     * first state-frame handshake. The gimbal task still remains inactive
+     * until a valid CSV command is received. */
+    if (latest_gimbal_cmd_valid &&
+        (uint32_t)(now - latest_gimbal_cmd_tick) <= ROBOT_COMM_GIMBAL_CMD_TIMEOUT_MS)
+    {
+        gimbal_state_packet.mode = telemetry_mode;
+    }
+    else
+    {
+        gimbal_state_packet.mode = 1U;
+    }
+
+    memcpy(gimbal_state_packet.q, quat, sizeof(gimbal_state_packet.q));
+    gimbal_state_packet.yaw = yaw->relative_angle;
+    gimbal_state_packet.yaw_vel = yaw->motor_gyro;
+    gimbal_state_packet.pitch = pitch->relative_angle;
+    gimbal_state_packet.pitch_vel = pitch->motor_gyro;
+    gimbal_state_packet.bullet_speed = 0.0f;
+    gimbal_state_packet.bullet_count = 0U;
+    append_CRC16_check_sum((uint8_t *)&gimbal_state_packet,
+                           sizeof(gimbal_state_packet));
+
+    result = CDC_Transmit_FS((uint8_t *)&gimbal_state_packet,
+                             sizeof(gimbal_state_packet));
+    for (retry = 0U; (result == USBD_BUSY) &&
+                     (retry < ROBOT_COMM_TX_BUSY_RETRY_COUNT); retry++)
+    {
+        robot_comm_tx_busy_count++;
+        osDelay(1U);
+        result = CDC_Transmit_FS((uint8_t *)&gimbal_state_packet,
+                                 sizeof(gimbal_state_packet));
+    }
+
+    if (result == USBD_OK)
+    {
+        robot_comm_tx_ok_count++;
+    }
+    else
+    {
+        robot_comm_tx_error_count++;
+    }
 }
 #endif
 
